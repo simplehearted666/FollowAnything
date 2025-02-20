@@ -1,5 +1,5 @@
-# FollowAnything_HIT
-Debugged FollowAnything Project
+# FollowAnything
+*解决了torch.cuda.amp.autocast 弃用、调用 torch.meshgrid 时未传入 indexing 参数以及使用 cv::imwrite 保存图像时，输入图像的深度不被所选编码器支持的问题*
 ## Windows系统环境配置：
 1. python下载：[python3.9.12](https://www.python.org/downloads/release/python-3912/)
 
@@ -35,7 +35,7 @@ Debugged FollowAnything Project
     |    2.0~2.2   |   11.7~12.1   |	
     |   1.13~1.15  |   11.6~11.8   |
 
-4. 下载模型文件(安装路径为FollowAnything_HIT\Segment-and-Track-Anything\ckpt)
+4. 下载模型文件(安装路径为`FollowAnything\Segment-and-Track-Anything\ckpt`)
 
     - SAM模型：[sam_vit_b_01ec64.pth](https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth)
   
@@ -55,7 +55,7 @@ Debugged FollowAnything Project
 
         * 若速度较慢，可选用镜像源下载：
         ```
-        pip install numpy opencv-python matplotlib scipy tqdm scikit-image mavsdk -i https://mirrors.aliyun.com/pypi/simple
+        pip install numpy==1.23.5 opencv-python matplotlib scipy tqdm scikit-image mavsdk -i https://mirrors.aliyun.com/pypi/simple
         ```
    - 处理兼容性依赖：
      ```
