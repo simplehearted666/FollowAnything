@@ -114,11 +114,13 @@ class VisDroneToCOCO:
             if os.path.exists(txt_path):
                 with open(txt_path, "r") as f:
                     for line in f:
+                        cleaned_line = line.strip().rstrip(',')#移除行尾逗号
                         try:
-                            parts = list(map(float, line.strip().split(",")))
-                        except ValueError:
+                            parts = list(map(float, cleaned_line.split(',')))
+                            if len(parts) < 8:
+                                raise ValueError
+                        except (ValueError, IndexError):
                             print(f"无效数据行：{line}")
-                        if len(parts) < 8:
                             continue
                         
                         '''
