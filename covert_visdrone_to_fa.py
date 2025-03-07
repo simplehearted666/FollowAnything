@@ -1,3 +1,4 @@
+'''生成掩膜文件'''
 import cv2
 import os
 import numpy as np
