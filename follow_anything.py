@@ -32,15 +32,15 @@ from DINO.collect_dino_features import *
 from DINO.dino_wrapper import *
 from sam.segment_anything import sam_model_registry, SamPredictor
 from SegTracker import SegTracker
-
+import traceback
 
 import asyncio
 import argparse
 import matplotlib
 import gc 
 import queue
-
-
+import torch.nn.functional as F
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 #clip, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k')
 #tokenizer = open_clip.get_tokenizer('ViT-B-32')
 #clip = clip.cuda()
@@ -61,11 +61,11 @@ parser.add_argument('--plot_visualizations', action='store_true', default =False
 parser.add_argument('--use_traced_model', action='store_true',  default =False, help='apply torch tracing')
 parser.add_argument('--dino_strides', default=4, type=int , help='Strides for dino')
 parser.add_argument('--desired_feature', default=[],  action='append', help='The feature we wish todetect and track from the annotated feature')
-parser.add_argument('--desired_height', default=240, type=int, help='desired_height resulution')
-parser.add_argument('--desired_width', default=320, type=int, help='desired_width resulution')
-parser.add_argument('--queries_dir', default='./queries', help='The directory to collect the queries from')
-parser.add_argument('--path_to_video', default='video/whales.mp4', help='The path to the video file')
-parser.add_argument('--save_images_to', default=False, help='The path to save all semgentation/tracking frames')
+parser.add_argument('--desired_height', default=1080, type=int, help='desired_height resulution')
+parser.add_argument('--desired_width', default=1920, type=int, help='desired_width resulution')
+parser.add_argument('--queries_dir', default='C:/Users/simplehearted/Desktop/FollowAnything_HIT/queries/drone_samples', help='The directory to collect the queries from')
+parser.add_argument('--path_to_video', default=r'C:\Users\simplehearted\Desktop\FollowAnything_HIT\Segment-and-Track-Anything\aot\datasets\VisDrone_SOT\val\sequences\uav0000024_00000_s', help='The path to the video file')
+parser.add_argument('--save_images_to', default='C:/Users/simplehearted/Desktop/FollowAnything_HIT/results/VisDrone_Results', help='The path to save all semgentation/tracking frames')###
 
 parser.add_argument('--video_order', default='any', help='')
 parser.add_argument('--class_threshold', default=0.4, help='Threshold below which similarity scores are assigned as not the same class')
@@ -101,7 +101,8 @@ parser.add_argument('--text_query', default='', help='')
 parser.add_argument('--dont_allow_contours_mix', default = False, action='store_true', help='dont allow contours mix')
 parser.add_argument('--num_of_clicks_for_detection', default=3, type = float,  help='pred_iou_thresh for sam')
 parser.add_argument('--sort_by', default="area",  help='stability_score|area|predicted_iou')
-
+parser.add_argument('--sam_refine', type=int, default=2, help='SAM细化迭代次数')
+parser.add_argument('--tracker_config', type=str, default='configs/aot.yaml', help='跟踪器配置文件路径')
 
 args = parser.parse_args()
 import matplotlib.pyplot as plt
@@ -168,6 +169,9 @@ def get_queries(cfg):
             if file_name.startswith("feat") and file_name.endswith(".pt"):
                 full_path = "{}/{}".format(cfg['queries_dir'], file_name)
                 query = torch.load(full_path) 
+                # 添加调试输出
+                print(f"[DEBUG] 加载特征文件: {file_name}")
+                print(f"特征维度: {query[0].shape}")  # 检查第一个样本的维度
                 if not isinstance(query, list): # annotations
                     query = [query]
                 key = file_name[4:-3]
@@ -181,6 +185,7 @@ def get_queries(cfg):
             mean_queries = OrderedDict({})
             for key,query in queries.items():
                 query = torch.stack(query).cuda().mean(dim=0)
+                assert query.shape[-1] == 6144, f"查询特征维度应为6144，实际为{query.shape[-1]}"  # 新增检查
                 query = torch.nn.functional.normalize(query, dim=0)
                 mean_queries[key] = query
             return mean_queries
@@ -217,23 +222,59 @@ def plot_similarity_if_neded(cfg, frame, similarity_rel, alpha = 0.5):
         _overlay = cv2.cvtColor(np.float32(_overlay), cv2.COLOR_BGR2RGB)
         plot_and_save_if_neded(cfg, _overlay, "DINO-CLIP-result")
     
-            
-def plot_and_save_if_neded(cfg, image_to_plot, stage_and_task, count, multiply = 1):
+
+def save_annotation(anno_dir, frame_idx, pred_mask, cfg):
+    """实时保存标注文件"""
+    # 生成标准VisDrone格式
+    anno_path = os.path.join(anno_dir, f"{frame_idx:07d}.txt")
+    
+    # 从mask提取bbox
+    contours, _ = cv2.findContours(pred_mask.astype(np.uint8), 
+                                  cv2.RETR_EXTERNAL, 
+                                  cv2.CHAIN_APPROX_SIMPLE)
+    
+    with open(anno_path, 'w') as f:
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            if w*h < cfg['min_area_size']:
+                continue
+            # VisDrone格式: <frame>,<id>,<x>,<y>,<w>,<h>,1,1,0,0
+            line = f"{frame_idx+1},1,{x},{y},{w},{h},1,1,0,0\n"
+            f.write(line)
+   
+def plot_and_save_if_neded(cfg, image_to_plot, stage_and_task, count, multiply=1):
+    """保存图像和对应的跟踪标注"""
     global mission_counter
 
+    # 原始图像保存逻辑保持不变
     if cfg['plot_visualizations']: 
         cv2.imshow(stage_and_task, image_to_plot)
         cv2.waitKey(cfg['wait_key'])
+    
     if cfg['save_images_to']:
-        file_name = "{}/{}/{}_{}.jpg".format(cfg['save_images_to'],stage_and_task,mission_counter ,count)
-        #if os.path.exists(filename):
-        # 执行图像缩放操作
+        # 生成标准VisDrone格式的标注文件
+        if stage_and_task == "Tracker-result":
+            annotation_dir = os.path.join(cfg['save_images_to'], "Annotations")
+            os.makedirs(annotation_dir, exist_ok=True)
+            
+            # 标注文件名格式: [sequence_name]_[mission_counter]_[frame_number].txt
+            seq_name = os.path.basename(cfg['path_to_video'])
+            anno_path = os.path.join(annotation_dir, f"{seq_name}_{mission_counter}_{count}.txt")
+            
+            # 从图像中提取检测框（这里需要根据实际跟踪结果获取）
+            # 假设已经通过跟踪算法获取到当前帧的bbox_list
+            if hasattr(cfg, 'current_bboxes'):
+                with open(anno_path, 'w') as f:
+                    for bbox in cfg.current_bboxes:
+                        # VisDrone标注格式: <frame>,<id>,<x>,<y>,<w>,<h>,<score>,<class>,<truncation>,<occlusion>
+                        # 简化版: <frame>,1,<x>,<y>,<w>,<h>,1,1,0,0
+                        line = f"{count},1,{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]},1,1,0,0\n"
+                        f.write(line)
+
+        # 原始图像保存
+        file_name = "{}/{}/{}_{}.jpg".format(cfg['save_images_to'], stage_and_task, mission_counter, count)
         scaled_image = image_to_plot * multiply
-
-        # 将缩放后的图像转换为 CV_8U 格式
         scaled_image_8u = cv2.convertScaleAbs(scaled_image)
-
-        # 保存图像
         cv2.imwrite(file_name, scaled_image_8u)
 
 def get_dino_result_if_needed(cfg, frame, class_labels):
@@ -268,6 +309,10 @@ def automatic_object_detection(vit_model, sam, video, queries, cfg, vehicle):
                 _, masks = sam.seg(frameshow)
                 print("Sam took: ", time.time() - t)
                 masks = sorted(masks, key=(lambda x: x[cfg['sort_by']]), reverse=True)
+
+                max_masks = 15  # 根据显存情况调整
+                masks = masks[:max_masks]
+
                 print("Sam generated {} masks".format(len(masks)))
                 masks_of_sam = get_vis_anns(masks, frameshow)
                 plot_and_save_if_neded(cfg, masks_of_sam, 'SAM-result', count,multiply = 255)
@@ -287,28 +332,45 @@ def automatic_object_detection(vit_model, sam, video, queries, cfg, vehicle):
                 class_labels = torch.zeros((frameshow.shape[0],frameshow.shape[1]))
                 thresh = torch.zeros((frameshow.shape[0],frameshow.shape[1]))
                 all_masks_sims = []
-                for ii,mask in enumerate(masks):
-                    if ii == 0: continue
+                for ii, mask in enumerate(masks):
+                    if ii == 0:
+                        continue
                     mask_similarity = []
                     m = mask['segmentation']
-                    if  cfg['detect'] == 'clip':
-                        #if ii == 0: continue
-                        if ii == 0 or mask['area']< float(cfg['min_area_size']): continue
-                        _x, _y, _w, _h = tuple(mask["bbox"])  # xywh bounding box
-                        
-                        img_roi = frameshow[_y : _y + _h, _x : _x + _w, :]
-                        
+                    
+                    if cfg['detect'] == 'clip':
+                        # CLIP模式的处理（保持原逻辑）
+                        if mask['area'] < float(cfg['min_area_size']):
+                            continue
+                        _x, _y, _w, _h = tuple(mask["bbox"])
+                        img_roi = frameshow[_y:_y+_h, _x:_x+_w, :]
                         img_roi = Image.fromarray(img_roi)
                         img_roi = clip_preprocess(img_roi).unsqueeze(0).cuda()
                         roifeat = vit_model.encode_image(img_roi)
-
-                        mask_feature = torch.nn.functional.normalize(roifeat, dim=-1)
+                        mask_feature = F.normalize(roifeat, dim=-1)
                     else:
-                        mask_feature = img_feat_norm[:,:,m].mean(axis=2)
+                        # DINO模式的核心修复
+                        # 步骤1：提取掩码区域特征（保留空间维度）
+                        h, w = img_feat_norm.shape[2], img_feat_norm.shape[3]
+                        mask_2d = torch.from_numpy(m).to(device)# 转换numpy数组为PyTorch张量并送GPU
+
+                        mask_2d = mask_2d.reshape(1, 1, h, w).float()# 调整形状并转换类型
+                        # 步骤2：应用掩码并池化
+                        with torch.no_grad():
+                            masked_feat = img_feat_norm * mask_2d  # [1, 384, H, W]
+                            pooled_feat = F.adaptive_avg_pool2d(masked_feat, 4)  # [1, 384, 4, 4]
+                            
+                            # 步骤3：展平并归一化
+                            mask_feature = pooled_feat.flatten(start_dim=1)  # [1, 384 * 16=6144]
+                            mask_feature = F.normalize(mask_feature, dim=1)
+                        # 立即释放中间变量
+                        del masked_feat, pooled_feat
+                        torch.cuda.empty_cache()
                     
                     tmp_map_dict = {}
                     counter_item = 0
                     for _idx, query in queries.items():
+                        query = query.unsqueeze(0)
                         mask_similarity.append(cosine_similarity(mask_feature.reshape(1,-1), query.reshape(1,-1)))
                         tmp_map_dict[counter_item]  = _idx
                         counter_item += 1
@@ -464,99 +526,153 @@ def compute_area_and_center(bounding_shape):
     return area, center
 
 def track_object_with_siammask(siammask, detections, video, cfg, tracker_cfg, vehicle):
-    x, y, w, h = detections[0]#todo
-    print(x, y, w, h)
-    toc = 0
-    f=0
-    while 1:
+    import signal
+    import traceback
+    global mission_counter, exit_flag
 
-        ret, im = video.read()
-        if not ret:
-            print("No stream!!!")
-            break 
-        im = cv2.resize(im, (cfg['desired_width'],cfg['desired_height']))
-        im_store = copy.deepcopy(im)
-        tic = cv2.getTickCount()
-        
-        if f == 0:  # init
-            
-            target_pos = np.array([x + w / 2, y + h / 2])
-            target_sz = np.array([w, h])
-            state = siamese_init(im, target_pos, target_sz, siammask, tracker_cfg['hp'], device=device)  # init tracker
-        elif f > 0:  # tracking
-            state = siamese_track(state, im, mask_enable=True, refine_enable=True, device=device)  # track
-            location = state['ploygon'].flatten()
-            mask = state['mask'] > state['p'].seg_thr
+    # 初始化信号处理
+    original_sigint = signal.getsignal(signal.SIGINT)
+    def signal_handler(sig, frame):
+        global exit_flag
+        print("\n[系统] 检测到用户中断 (Ctrl+C)")
+        exit_flag = True
+        signal.signal(signal.SIGINT, original_sigint)
+    signal.signal(signal.SIGINT, signal_handler)
 
-            im[:, :, 2] = (mask > 0) * 255 + (mask == 0) * im[:, :, 2]
+    # 初始化跟踪参数
+    x, y, w, h = detections[0]
+    seq_name = os.path.basename(cfg['path_to_video'])
+    annotation_dir = os.path.join(cfg['save_images_to'], "Annotations", seq_name)
+    os.makedirs(annotation_dir, exist_ok=True)
 
-            bounding_shape = np.int0(location).reshape((-1, 1, 2))
-            _, mean_point = compute_area_and_center(bounding_shape)
-            compute_drone_action_while_tracking(mean_point, cfg, vehicle)
+    # 视频流元数据
+    is_video_file = os.path.isfile(cfg['path_to_video'])
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT)) if is_video_file else -1
+    processed_frames = 0
+    last_valid_bbox = (x, y, w, h)
+    state = None
 
-            cv2.polylines(im, [bounding_shape], True, (0, 255, 0), 3)
-            cv2.imshow('Tracker-result', im)
-            # 检查是否需要保存图像
-            if cfg['save_images_to']:
-                # 确保 im 是 CV_8U 格式
-                im_8u = cv2.convertScaleAbs(im)
-                # 保存 Tracker-result 图像
-                cv2.imwrite("{}/Tracker-result/{}.jpg".format(cfg['save_images_to'], f), im_8u)
+    try:
+        print(f"[跟踪] 开始 {seq_name} | 总帧数: {total_frames if total_frames != -1 else '实时流'}")
+        cv2.namedWindow('Tracking', cv2.WINDOW_NORMAL)
 
-            # 等待按键事件
-            key = cv2.waitKey(cfg['wait_key'])
-            if key > 0:
+        while not exit_flag:
+            # 带超时机制的帧读取
+            retry_count = 0
+            while retry_count < 5 and not exit_flag:
+                ret, frame = video.read()
+                if ret:
+                    break
+                print(f"  读取失败重试 ({retry_count+1}/5)")
+                retry_count += 1
+                time.sleep(0.01 * retry_count)  # 指数退避等待
+            else:
+                print("⚠️ 连续读取失败，终止跟踪")
                 break
 
-            # 再次检查是否需要保存图像
-            if cfg['save_images_to']:
-                # 确保 im_store 是 CV_8U 格式
-                im_store_8u = cv2.convertScaleAbs(im_store)
-                # 保存 Stream_tracking 图像
-                cv2.imwrite("{}/Stream_tracking/{}.jpg".format(cfg['save_images_to'], f), im_store_8u)
+            if not ret:
+                if is_video_file and processed_frames >= total_frames:
+                    print("✅ 视频正常结束")
+                else:
+                    print("⚠️ 异常视频中断")
+                break
 
-        f+=1
-        toc += cv2.getTickCount() - tic
-    toc /= cv2.getTickFrequency()
-    fps = f / toc
-    print('SiamMask Time: {:02.1f}s Speed: {:3.1f}fps (with visulization!)'.format(toc, fps))
+            # 帧处理逻辑
+            processed_frames += 1
+            frame = cv2.resize(frame, (cfg['desired_width'], cfg['desired_height']))
+            tic = cv2.getTickCount()
 
+            # 初始化/更新跟踪器
+            if processed_frames == 1:  # 第一帧初始化
+                target_pos = np.array([x + w/2, y + h/2])
+                target_sz = np.array([w, h])
+                state = siamese_init(frame, target_pos, target_sz, siammask, 
+                                  tracker_cfg['hp'], device=device)
+            else:  # 后续帧跟踪
+                state = siamese_track(state, frame, mask_enable=True,
+                                    refine_enable=True, device=device)
 
-def create_video_from_images(cfg):
+                # 解析跟踪结果（带异常恢复）
+                try:
+                    bbox = state['ploygon'].flatten().astype(int)
+                    x_min, y_min = np.min(bbox[::2]), np.min(bbox[1::2])
+                    x_max, y_max = np.max(bbox[::2]), np.max(bbox[1::2])
+                    w, h = x_max - x_min, y_max - y_min
+                    last_valid_bbox = (x_min, y_min, w, h)
+                except Exception as e:
+                    print(f"⚠️ 跟踪异常: {str(e)}，使用最后有效边界框")
+                    x_min, y_min, w, h = last_valid_bbox
 
-    import glob
-    vfile= '{}/video_from_images.avi'.format(cfg['path_to_video'])
-    fileidx = 0
-    if not  os.path.exists(vfile):
-        img_array = []
-        if cfg['video_order'] == 'any':
-            for filename in os.listdir(cfg['path_to_video']):
-                filename = os.path.join(cfg['path_to_video'],filename )
-                img = cv2.imread(filename)
-                height, width, layers = img.shape
-                size = (width,height)
-                img_array.append(img)
-                fileidx+=1
-        else:
-            while 1:
-                filename = os.path.join(cfg['path_to_video'], f"{fileidx:06d}.png")
-                if not os.path.exists(filename): 
-                    filename = os.path.join(cfg['path_to_video'], "1_{}.jpg".format(fileidx))#f"{fileidx}.jpg")
-                if not os.path.exists(filename):    
-                    break
-                img = cv2.imread(filename)
-                height, width, layers = img.shape
-                size = (width,height)
-                img_array.append(img)
-                fileidx+=1
+                # 生成标注文件
+                anno_path = os.path.join(annotation_dir, 
+                                       f"{mission_counter}_{processed_frames:04d}.txt")
+                with open(anno_path, 'w') as f:
+                    f.write(f"{processed_frames},1,{x_min},{y_min},{w},{h},1,1,0,0\n")
 
-        out = cv2.VideoWriter('{}/video_from_images.avi'.format(cfg['path_to_video']),cv2.VideoWriter_fourcc(*'DIVX'), 15, size)
-         
-        for i in range(len(img_array)):
-            out.write(img_array[i])
-        out.release()
-    cfg['path_to_video'] = vfile
-    return cv2.VideoCapture(cfg['path_to_video']) 
+                # 可视化处理
+                vis_frame = frame.copy()
+                cv2.rectangle(vis_frame, (x_min, y_min), (x_min+w, y_min+h),
+                             (0, 255, 0), 2)
+                cv2.putText(vis_frame, f"Frame: {processed_frames}/{total_frames}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+
+                # 保存结果图像
+                img_save_path = os.path.join(cfg['save_images_to'], "Tracker-result",
+                                           f"{mission_counter}_{processed_frames:04d}.jpg")
+                cv2.imwrite(img_save_path, vis_frame)
+
+            # 显示和事件处理（关键修复点）
+            cv2.imshow('Tracking', vis_frame if processed_frames > 1 else frame)
+            key = cv2.waitKey(1) & 0xFF  # 必须处理所有事件
+            if key == 27:  # ESC键
+                print("\n用户请求退出")
+                exit_flag = True
+            elif key == ord(' '):  # 空格暂停
+                print("暂停，按任意键继续...")
+                cv2.waitKey(0)
+
+            # 性能监控
+            toc = (cv2.getTickCount() - tic) / cv2.getTickFrequency()
+            print(f"帧 {processed_frames:04d} | 耗时: {toc*1000:.1f}ms | "
+                  f"剩余帧: {total_frames - processed_frames if total_frames > 0 else 'N/A'}  ", 
+                  end='\r')
+
+    except Exception as e:
+        print(f"🔥 严重错误: {str(e)}")
+        traceback.print_exc()
+
+    finally:
+        # 强制资源释放（关键修复点）
+        print("\n正在清理资源...")
+        release_start = time.time()
+        
+        if 'video' in locals() and video.isOpened():
+            video.release()
+            print("  视频流已释放")
+            
+        cv2.destroyAllWindows()
+        print("  OpenCV窗口已关闭")
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("  GPU缓存已清空")
+            
+        if state is not None:
+            del state
+            print("  跟踪器状态已重置")
+            
+        print(f"资源清理耗时: {(time.time() - release_start)*1000:.1f}ms")
+
+        # 最终报告
+        print("\n" + "="*60)
+        print(f"跟踪报告".center(60))
+        print("-"*60)
+        print(f"▪ 序列名称: {seq_name}")
+        print(f"▪ 总处理帧: {processed_frames}")
+        print(f"▪ 标注文件: {annotation_dir}/*.txt")
+        print(f"▪ 结果图像: {cfg['save_images_to']}/Tracker-result/*.jpg")
+        print("="*60)
+
 
 def init_system():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -605,12 +721,14 @@ def init_system():
     else:
         print("Exiting. No such detector {}".format(cfg['detect']))
         exit(9)
-
+    # 新增数据集根目录定义
+    cfg["data_root"] = "C:/Users/simplehearted/Desktop/FollowAnything_HIT/Segment-and-Track-Anything/aot/datasets/VisDrone_SOT"
     
     print("Init video...")
     if os.path.isdir(cfg["path_to_video"]):
-        print("Making video from images in directory {}".format(cfg["path_to_video"]))
-        video = create_video_from_images(cfg)
+        print(f"Making video from SPECIFIED sequence directory: {cfg['path_to_video']}")
+        # 直接使用用户输入的路径，不再覆盖路径
+        video = create_video_from_images(cfg)   
     elif os.path.exists(cfg["path_to_video"]) and cfg['fps']<1:
         print("Reading video  {}".format(cfg["path_to_video"]))
         video = cv2.VideoCapture(cfg["path_to_video"]) 
@@ -635,6 +753,12 @@ def init_system():
         for directory_to_create in ['SAM-result', 'Stream_segmenting', 'DINO-CLIP-result', 'Tracker-result', 'Stream_tracking', 'Detection']:
             create_dir_if_doesnt_exists(os.path.join(cfg['save_images_to'],directory_to_create))
 
+    print("\n[路径验证]")
+    print(f"数据集根目录: {cfg['data_root']}")
+    print(f"视频输入路径: {cfg['path_to_video']}")
+    print(f"结果保存路径: {cfg['save_images_to']}")
+    print(f"特征查询路径: {cfg['queries_dir']}")
+    print(f"帧分辨率: {cfg['desired_width']}x{cfg['desired_height']}\n")
     return device, tracker_cfg, cfg, tracker, detector, segmentor, queries, video, vehicle
 
 
@@ -761,55 +885,84 @@ def compute_drone_action_while_tracking(mean_point, cfg, vehicle):
                                                        direction_vector[2],
                                                        K= 1.5, yaw_K = 0.15 ))
     
-def track_object_with_aot(tracker, pred_mask, frame,  video, cfg, vehicle, track_single_object = True):
-    
+def track_object_with_aot(tracker, pred_mask, frame, video, cfg, vehicle, track_single_object=True):
+    """Modified version with frame limit and proper resource management"""
     tracker.restart_tracker()
-
-    if track_single_object:
-        pred_mask[pred_mask!=1] = 0 
     
-    mean_points  = []
-    timing = 0; frame_idx = 0
+    # Initialize tracking parameters
+    frame_idx = 0
+    total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT)) if hasattr(video, 'get') else len(video.frame_files)
+    max_retries = 5
+    last_valid_mask = None
+    seq_name = os.path.basename(cfg['path_to_video'])
+
+    # 创建标注目录
+    anno_dir = os.path.join(cfg['save_images_to'], "Annotations", seq_name)
+    os.makedirs(anno_dir, exist_ok=True)
     
-    with torch.amp.autocast('cuda'):
-        while 1: # 
-            t = time.time()
-            ##############################################
-            #frame = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
-            if frame_idx == 0:
-                torch.cuda.empty_cache()
-                gc.collect()
-                tracker.add_reference(frame, pred_mask)
-            else:
-                pred_mask = tracker.track(frame,update_memory=True)
+    try:
+        with torch.amp.autocast('cuda'):
+            # Process frames within known total count
+            while frame_idx < total_frames:
+                start_time = time.time()
+                
+                # 1. Frame processing logic
+                if frame_idx == 0:  # First frame initialization
+                    tracker.add_reference(frame, pred_mask)
+                    torch.cuda.empty_cache()
+                else:
+                    # 2. Track object
+                    pred_mask = tracker.track(frame, update_memory=True)
+                    if track_single_object: 
+                        pred_mask[pred_mask != 1] = 0
+                    last_valid_mask = pred_mask.copy() if pred_mask is not None else last_valid_mask
 
-            if track_single_object: pred_mask[pred_mask!=1] = 0 
-            torch.cuda.empty_cache()
-            gc.collect()
-            ###############################################
+                # 3. Visualization and saving
+                if pred_mask is not None:
+                    save_annotation(anno_dir, frame_idx, pred_mask, cfg)
+                    vis_masks = multiclass_vis(pred_mask, frame, np.max(pred_mask) + 1, np_used=True)
+                    plot_and_save_if_neded(cfg, vis_masks, 'Tracker-result', frame_idx, multiply=255)
+                
+                # 4. Read next frame with retry mechanism
+                retry_count = 0
+                read_success = False
+                next_frame = None
+                while not read_success and retry_count < max_retries:
+                    read_success, next_frame = video.read()
+                    if not read_success:
+                        print(f"Frame {frame_idx+1} read failed, retrying ({retry_count+1}/{max_retries})")
+                        retry_count += 1
+                        time.sleep(0.1 * retry_count)  # Exponential backoff
+                
+                # 5. Check termination conditions
+                if not read_success:
+                    if frame_idx >= total_frames - 1:  # Normal completion
+                        print(f"\nSuccessfully processed all {total_frames} frames")
+                        break
+                    else:  # Unexpected EOF
+                        print(f"\nWarning: Early termination at frame {frame_idx+1}/{total_frames}")
+                        break
+                
+                # 6. Prepare next iteration
+                frame = cv2.resize(next_frame, (cfg['desired_width'], cfg['desired_height']))
+                frame_idx += 1
+                
+                # 7. Progress monitoring
+                fps = 1.0 / (time.time() - start_time)
+                print(f"Frame {frame_idx:04d}/{total_frames} | FPS: {fps:.1f} | Objs: {tracker.get_obj_num()}  ", end='\r')
 
-            mean_point = get_mean_point(pred_mask)
-            if mean_point is None and cfg['redetect_by']!= 'tracker': return "FAILED"
-            
-            compute_drone_action_while_tracking(mean_point, cfg, vehicle)
-           
-            ##############################################
-            vis_masks = multiclass_vis(pred_mask, frame, np.max(pred_mask) + 1, np_used = True)
-            plot_and_save_if_neded(cfg, frame, "Stream_tracking",frame_idx)
-            plot_and_save_if_neded(cfg, vis_masks, 'Tracker-result',frame_idx,multiply = 255)
-            print("processed frame {}, obj_num {}".format(frame_idx,tracker.get_obj_num()),end='\r')
-            
-            ##############################################
-
-            frame_idx += 1
-            read_one_frame = False
-            while not read_one_frame:
-                read_one_frame, frame = video.read()
-                if not read_one_frame and os.path.exists(cfg["path_to_video"]) and cfg['fps']<1:
-                    print("Finished reading video...")
-                    exit(0)
-
-            frame = cv2.resize(frame, (cfg['desired_width'],cfg['desired_height']))
+    except KeyboardInterrupt:
+        print("\nUser interrupted tracking process")
+    except Exception as e:
+        print(f"\nCritical error at frame {frame_idx}: {str(e)}")
+        traceback.print_exc()
+    finally:
+        # 修改资源清理方式
+        if hasattr(tracker, 'restart_tracker'):
+            tracker.restart_tracker()  # 使用SegTracker原有的清理方法
+            tracker.clear_memory()
+        torch.cuda.empty_cache()
+        gc.collect()
         
 def get_mean_point(pred_mask, bounding_shape = None):
     
@@ -867,6 +1020,7 @@ def detect_by_box(sam , video, cfg, vehicle):
 def detect_object(cfg, detector, segmentor, video, queries):
     print("aplying {} detection...".format(cfg['detect']))
     if cfg['detect'] in ['dino', 'clip']:
+        
         bounding_boxes, masks_of_sam, saved_frame = automatic_object_detection(vit_model=detector, sam = segmentor, 
                                                                                video=video, queries=queries, 
                                                                                cfg=cfg, vehicle=vehicle)
@@ -874,10 +1028,12 @@ def detect_object(cfg, detector, segmentor, video, queries):
         #plot_and_save_if_neded(cfg, vis_masks, 'Tracker-result')
     else:
         if cfg['detect'] == 'click':
-            bounding_boxes, masks, saved_frame = detect_by_click(sam = detector, video=video, cfg=cfg, vehicle=vehicle)
+            with torch.no_grad():
+                bounding_boxes, masks, saved_frame = detect_by_click(sam = detector, video=video, cfg=cfg, vehicle=vehicle)
         
         else:
-            bounding_boxes, masks, saved_frame = detect_by_box(sam = detector, video=video, cfg=cfg, vehicle=vehicle)
+            with torch.no_grad():
+                bounding_boxes, masks, saved_frame = detect_by_box(sam = detector, video=video, cfg=cfg, vehicle=vehicle)
         
         if  masks is not None:
             masks_of_sam = bool_mask_to_integer(masks)
